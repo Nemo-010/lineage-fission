@@ -24,6 +24,12 @@ on:
   push:
     paths: ["fission/**", "test/**", "tools/**", ".github/workflows/fission.yml"]
 
+# A push runs `selftest` and nothing else: it needs no source tree and finishes
+# in about a minute. Everything from `bootstrap` down needs a runner with 150 GB
+# of disk (a hosted runner has 14 GB), so those jobs only run when the workflow
+# is dispatched on purpose -- otherwise every push queues a job that can never
+# start, or worse, starts and dies three hours in.
+
 env:
   LINEAGE_BRANCH: ${{ inputs.branch || 'lineage-22.1' }}
   DEVICE: ${{ inputs.device || 'alioth' }}
@@ -63,6 +69,7 @@ jobs:
   # ---------------------------------------------------------------------
   bootstrap:
     needs: selftest
+    if: github.event_name == 'workflow_dispatch'
     # A hosted runner has 14 GB. A LineageOS sync is ~100 GB. Do not pretend.
     runs-on: [self-hosted, linux, lineage-bootstrap]
     timeout-minutes: 360
@@ -127,6 +134,7 @@ jobs:
   # ---------------------------------------------------------------------
   shard:
     needs: bootstrap
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       max-parallel: 20          # hosted: 20 concurrent on Free, 40 Pro, 60 Team
@@ -181,6 +189,7 @@ jobs:
   # ---------------------------------------------------------------------
   assemble:
     needs: [bootstrap, shard]
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, linux, lineage-assemble]
     timeout-minutes: 350
     steps:
@@ -219,6 +228,7 @@ jobs:
   # ---------------------------------------------------------------------
   verify:
     needs: assemble
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, linux, masternode]
     steps:
       - run: |
