@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# produced by the tools, not part of the repo
+plan.json
+split/
+mx/
+out/
+*.tar
+.mn-demo/

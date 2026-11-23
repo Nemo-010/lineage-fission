@@ -1,0 +1,227 @@
+name: fission
+
+# One repository, one workflow, one matrix. GitHub allows 256 jobs per matrix
+# run (measured: docs.github.com/en/actions/reference/limits), which is plenty.
+# What it does NOT allow is enough disk on a hosted runner to hold LineageOS:
+# 14 GB SSD (measured). So the matrix is only useful if each shard syncs its
+# own slice and the final packaging runs on a runner that has room.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: LineageOS codename (e.g. alioth)
+        default: alioth
+      vendor:
+        description: OEM for the device tree (e.g. xiaomi)
+        default: xiaomi
+      shards:
+        description: how many matrix jobs (<= 256)
+        default: "8"
+      branch:
+        description: LineageOS branch
+        default: lineage-22.1
+  push:
+    paths: ["fission/**", "test/**", "tools/**", ".github/workflows/fission.yml"]
+
+env:
+  LINEAGE_BRANCH: ${{ inputs.branch || 'lineage-22.1' }}
+  DEVICE: ${{ inputs.device || 'alioth' }}
+  VENDOR: ${{ inputs.vendor || 'xiaomi' }}
+  SHARDS: ${{ inputs.shards || '8' }}
+  # Identical path on every runner: ninja files embed absolute paths, so a
+  # shard that syncs to a different directory cannot reuse the bootstrap's
+  # build.ninja.
+  SRC: /build/lineage
+
+concurrency:
+  group: fission-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 0. Unit tests: no source tree, seconds, runs on anything.
+  # ---------------------------------------------------------------------
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: apt ninja
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
+      - name: unit + end-to-end (real ninja, split -> build -> merge -> finish)
+        run: python3 -m unittest discover -s test -v
+
+  # ---------------------------------------------------------------------
+  # 1. Bootstrap: the only job that needs the whole tree.
+  #
+  # It must produce out/soong/build.ninja (the configured build graph) before
+  # anything can be split. That is the part no amount of matrix parallelism
+  # removes, and it is why this job needs a runner with real disk.
+  # ---------------------------------------------------------------------
+  bootstrap:
+    needs: selftest
+    # A hosted runner has 14 GB. A LineageOS sync is ~100 GB. Do not pretend.
+    runs-on: [self-hosted, linux, lineage-bootstrap]
+    timeout-minutes: 360
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      digest: ${{ steps.plan.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: preflight (measured, fails loudly)
+        run: |
+          python3 -m fission.cli doctor --root . --min-free-gb 150 --min-ram-gb 16 --min-cpus 8
+      - name: repo init + sync
+        run: |
+          mkdir -p "$SRC" && cd "$SRC"
+          repo init -u https://github.com/LineageOS/android -b "$LINEAGE_BRANCH" \
+            --no-clone-bundle --partial-clone --clone-filter=blob:limit=10m
+          repo sync -c --no-tags --optimized-fetch --prune -j"$(nproc)"
+      - name: plan (manifests -> projects -> sections)
+        id: plan
+        run: |
+          python3 -m fission.cli plan \
+            --manifest "$SRC/.repo/manifests/default.xml" \
+            --tree "$SRC" \
+
+            --manifest-url https://github.com/LineageOS/android \
+            --device "$DEVICE" --vendor "$VENDOR" \
+            --expand-deps tree --out "$SRC/.fission/plan.json"
+          python3 -c "import json;print('digest='+json.load(open('$SRC/.fission/plan.json'))['digest'])" >> "$GITHUB_OUTPUT"
+      - name: breakfast + generate the build graph
+        run: |
+          cd "$SRC"
+          source build/envsetup.sh
+          breakfast "$DEVICE"
+          # Soong/Kati write out/combined-$DEVICE.ninja here. Nothing else can
+          # be split until this exists.
+          ninja -f "out/combined-$DEVICE.ninja" -t targets >/dev/null || true
+          ls -la out/combined-*.ninja out/soong/build.ninja
+      - name: split (graph -> shards -> one local manifest each)
+        id: matrix
+        run: |
+          python3 -m fission.cli split \
+            --ninja "out/combined-$DEVICE.ninja" --root "$SRC" \
+            --plan "$SRC/.fission/plan.json" --workers "$SHARDS" \
+            --ninja-log "$SRC/out/.ninja_log" --out "$SRC/.fission/split"
+          python3 -m fission.cli matrix \
+            --plan "$SRC/.fission/plan.json" \
+            --split-plan "$SRC/.fission/split/plan.json" \
+            --out "$SRC/.fission/matrix"
+          echo "matrix=$(python3 -c 'import json;print(json.dumps(json.load(open("'"$SRC"'/.fission/matrix/matrix.json"))))')" >> "$GITHUB_OUTPUT"
+      - name: publish the graph + split (shards must not regenerate it)
+        run: |
+          cd "$SRC"
+          tar -C out -cf "$RUNNER_TEMP/graph.tar" \
+            "combined-$DEVICE.ninja" soong/build.ninja .ninja_deps .ninja_log
+          gh release upload "fission-$GITHUB_RUN_ID" "$RUNNER_TEMP/graph.tar" \
+            .fission/plan.json .fission/split/plan.json .fission/matrix/matrix.json \
+            .fission/matrix/local_manifests/*.xml --clobber
+        env: {GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
+
+  # ---------------------------------------------------------------------
+  # 2. Shards: one matrix entry per shard, up to 256.
+  # ---------------------------------------------------------------------
+  shard:
+    needs: bootstrap
+    strategy:
+      fail-fast: false
+      max-parallel: 20          # hosted: 20 concurrent on Free, 40 Pro, 60 Team
+      matrix: ${{ fromJSON(needs.bootstrap.outputs.matrix) }}
+    runs-on: ubuntu-latest      # sparse sync; fails loudly if a shard is too big
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: disk budget
+        run: python3 -m fission.cli doctor --root . --min-free-gb 10 --min-ram-gb 8 --min-cpus 2
+      - name: fetch graph + our local manifest
+        run: |
+          mkdir -p "$SRC"
+          gh release download "fission-$GITHUB_RUN_ID" --pattern graph.tar -O "$RUNNER_TEMP/graph.tar"
+          tar -C "$SRC/out" -xf "$RUNNER_TEMP/graph.tar"
+          gh release download "fission-$GITHUB_RUN_ID" \
+            --pattern "shard-${{ matrix.shard }}.xml" -D "$SRC/.repo/local_manifests"
+        env: {GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
+      - name: sync only this shard's projects
+        env:
+          SHARD_MANIFEST: ${{ runner.temp }}/${{ matrix.manifest }}
+        run: |
+          cd "$SRC"
+          repo init -u https://github.com/LineageOS/android -b "$LINEAGE_BRANCH" \
+            --no-clone-bundle --partial-clone --clone-filter=blob:limit=10m
+          # repo sync <paths...> syncs only the named projects. That is the
+          # whole trick: 14 GB is enough for one section's source, not for
+          # 1474 projects.
+          mapfile -t PATHS < <(python3 "$GITHUB_WORKSPACE/tools/shard_paths.py" "$SHARD_MANIFEST")
+          echo "syncing ${#PATHS[@]} projects for ${{ matrix.shard }}"
+          repo sync -c --no-tags --optimized-fetch --prune -j"$(nproc)" "${PATHS[@]}"
+      - name: build this shard
+        run: |
+          cd "$SRC"
+          mapfile -t TARGETS < "${{ matrix.targets }}"
+          ninja -f "out/combined-$DEVICE.ninja" -j"$(nproc)" "${TARGETS[@]}"
+      - name: pack
+        run: |
+          python3 -m fission.cli pack --root "$SRC" \
+            --targets "${{ matrix.owned }}" \
+            --tar "$RUNNER_TEMP/shard-${{ matrix.shard }}.tar" \
+            --worker "${{ matrix.shard }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard-${{ matrix.shard }}.tar
+          retention-days: 3
+
+  # ---------------------------------------------------------------------
+  # 3. Assemble: merge, make ninja agree, finish the images.
+  #    Big runner, not the masternode.
+  # ---------------------------------------------------------------------
+  assemble:
+    needs: [bootstrap, shard]
+    runs-on: [self-hosted, linux, lineage-assemble]
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: {pattern: "shard-*", merge-multiple: true, path: "${{ runner.temp }}/artifacts"}
+      - name: restore graph
+        run: |
+          mkdir -p "$SRC/out"
+          gh release download "fission-$GITHUB_RUN_ID" --pattern graph.tar -O "$RUNNER_TEMP/graph.tar"
+          tar -C "$SRC/out" -xf "$RUNNER_TEMP/graph.tar"
+        env: {GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
+      - name: merge (hash-verified, ownership-aware)
+        run: |
+          python3 -m fission.cli merge --dest "$SRC" --strict \
+            --ownership-dir .fission/split \
+            $(for t in "$RUNNER_TEMP"/artifacts/shard-*.tar; do printf -- "--artifact %s " "$t"; done)
+      - name: freshen (mtimes + real .ninja_log from the shards)
+        run: python3 -m fission.cli freshen --ninja "out/combined-$DEVICE.ninja" --root "$SRC"
+      - name: finish images
+        run: |
+          cd "$SRC" && source build/envsetup.sh && brunch "$DEVICE"
+      - name: publish the finished artefacts (release assets, not artifacts)
+        run: |
+          gh release upload "fission-$GITHUB_RUN_ID" \
+            "$SRC"/out/target/product/"$DEVICE"/lineage-*.zip \
+            "$SRC"/out/target/product/"$DEVICE"/boot.img \
+            --clobber
+          cd "$SRC/out/target/product/$DEVICE" && sha256sum *.zip boot.img > SHA256SUMS
+          gh release upload "fission-$GITHUB_RUN_ID" SHA256SUMS --clobber
+        env: {GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
+
+  # ---------------------------------------------------------------------
+  # 4. Masternode: verify, do not assemble. 20 GB and slow WSL is enough for
+  #    this and only this.
+  # ---------------------------------------------------------------------
+  verify:
+    needs: assemble
+    runs-on: [self-hosted, linux, masternode]
+    steps:
+      - run: |
+          gh release download "fission-$GITHUB_RUN_ID" --pattern SHA256SUMS
+          gh release download "fission-$GITHUB_RUN_ID" --pattern "lineage-*.zip"
+          sha256sum -c SHA256SUMS
